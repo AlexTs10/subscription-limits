@@ -1,7 +1,7 @@
 # Subscription Limits
 
-A small macOS menu bar app. One list shows each local Claude and Codex
-subscription, its remaining limits, and its reset times. Click the **gauge
+A small macOS menu bar app. One list shows each local Claude, Codex, and
+Gemini / Antigravity subscription, its remaining limits, and its reset times. Click the **gauge
 icon** in the menu bar to open the list. Hover for a text summary. Updates run
 every five minutes. Escape closes the menu.
 
@@ -21,7 +21,10 @@ cache folder records its own icon position for fault checks.
   Keychain storage key. This finds Personal Max even if T3 uses other accounts.
 - Codex: existing `auth.json` files from local `.codex*` directories, T3
   settings, and CodexBar profile paths.
-- Claude and Codex usage endpoints supply current limits. When Claude rejects
+- Gemini / Antigravity: the existing Antigravity app OAuth state, standalone
+  Antigravity OAuth file, or `agy` CLI Keychain login. Google’s quota summary
+  supplies the reported Gemini, Claude/GPT, and any additional quota buckets.
+- Claude, Codex, and Google Antigravity usage endpoints supply current limits. When Claude rejects
   a usage request, the installed CodexBar command-line browser reader can
   supply a fallback. Its email and organization must match a verified local
   account without ambiguity. CodexBar's menu app can stay closed.
@@ -43,6 +46,8 @@ subscriptions without a local login cannot supply subscription limits.
 
 Credentials stay in process memory. They are sent only to the provider that
 issued them. No credential is copied to this project or to the app's cache.
+Antigravity credentials are read only from the app, CLI, or Keychain; the app
+does not refresh, replace, or write them.
 The cache at `~/Library/Application Support/Subscription Limits/snapshot.json`
 contains account labels, IDs, email addresses, limits, and update status.
 The adjacent `identities.json` stores verified account details and one-way

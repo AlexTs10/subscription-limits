@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -28,9 +29,14 @@ HOME = Path.home()
 STATE = HOME / "Library/Application Support/Subscription Limits"
 CLAUDE_DESKTOP = HOME / "Library/Application Support/Claude/config.json"
 T3_SETTINGS = HOME / ".t3/userdata/settings.json"
+ANTIGRAVITY_STATE = HOME / "Library/Application Support/Antigravity/User/globalStorage/state.vscdb"
+ANTIGRAVITY_TOKEN = HOME / ".gemini/jetski-standalone-oauth-token"
 ISO = lambda: dt.datetime.now(dt.timezone.utc).isoformat()
 POLL_INTERVAL = 300
 IDENTITY_TTL = 86400
+ANTIGRAVITY_API = "https://daily-cloudcode-pa.googleapis.com/v1internal:"
+ANTIGRAVITY_LOAD = ANTIGRAVITY_API + "loadCodeAssist"
+ANTIGRAVITY_QUOTA = ANTIGRAVITY_API + "retrieveUserQuotaSummary"
 
 
 class ReadError(Exception):
@@ -74,10 +80,14 @@ def load_json(path, default=None):
         return {} if default is None else default
 
 
-def keychain(service):
+def keychain(service, account=None):
+    command = ["/usr/bin/security", "find-generic-password", "-s", service]
+    if account:
+        command += ["-a", account]
+    command += ["-w"]
     try:
         result = subprocess.run(
-            ["/usr/bin/security", "find-generic-password", "-s", service, "-w"],
+            command,
             capture_output=True, timeout=10, check=False)
     except (OSError, subprocess.TimeoutExpired):
         raise ReadError("Keychain access unavailable")
@@ -137,6 +147,100 @@ def get_json(url, token, account_id=None):
         raise ReadError("Provider unavailable (HTTP %s)" % exc.code, 180)
     except (OSError, ValueError):
         raise ReadError("Connection unavailable", 60)
+
+
+def post_json(url, token, payload):
+    if url not in (ANTIGRAVITY_LOAD, ANTIGRAVITY_QUOTA):
+        raise ReadError("Unsupported provider endpoint")
+    headers = {
+        "Authorization": "Bearer " + token,
+        "User-Agent": "antigravity/hub/2.25.0 darwin/arm64",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    try:
+        body = json.dumps(payload).encode()
+        request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        with urllib.request.build_opener(NoRedirect).open(request, timeout=10) as response:
+            data = json.load(response)
+            if not isinstance(data, dict):
+                raise ReadError("Provider response format changed", 300)
+            return data
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            raise ReadError("Usage checks paused (HTTP 429)",
+                            retry_delay(exc.headers.get("Retry-After")), "rate_limited")
+        if exc.code in (401, 403):
+            raise ReadError("Open Antigravity to renew its login", 300)
+        raise ReadError("Provider unavailable (HTTP %s)" % exc.code, 180)
+    except (OSError, ValueError):
+        raise ReadError("Connection unavailable", 60)
+
+
+def google_access_token(value):
+    """Extract an existing Antigravity OAuth access token without persisting it."""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "strict")
+    if not isinstance(value, str) or not value:
+        return None
+    if value.startswith("go-keyring-base64:"):
+        try:
+            value = base64.b64decode(value.removeprefix("go-keyring-base64:"), validate=True).decode()
+        except (ValueError, UnicodeDecodeError):
+            return None
+    try:
+        value = json.loads(value)
+    except ValueError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    for key in ("access_token", "accessToken"):
+        token = value.get(key)
+        if isinstance(token, str) and token:
+            return token
+    for key in ("oauthToken", "credentials", "oauth"):
+        nested = value.get(key)
+        if isinstance(nested, dict):
+            token = google_access_token(json.dumps(nested))
+            if token:
+                return token
+    return None
+
+
+def sqlite_value(path, key):
+    connection = None
+    try:
+        connection = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+        row = connection.execute("SELECT value FROM ItemTable WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+    except (sqlite3.Error, OSError):
+        return None
+    finally:
+        if connection:
+            connection.close()
+
+
+def antigravity_tokens():
+    """Find locally stored Antigravity logins, deduplicated by one-way fingerprint."""
+    candidates = []
+    app_token = sqlite_value(ANTIGRAVITY_STATE, "antigravityUnifiedStateSync.oauthToken")
+    if app_token:
+        candidates.append(("Antigravity app", app_token))
+    data = load_json(ANTIGRAVITY_TOKEN)
+    if data:
+        candidates.append(("Antigravity", json.dumps(data)))
+    try:
+        candidates.append(("Antigravity CLI", keychain("gemini", "antigravity")))
+    except ReadError:
+        pass
+    tokens, seen = [], set()
+    for source, value in candidates:
+        token = google_access_token(value)
+        fingerprint = hashlib.sha256(token.encode()).hexdigest() if token else None
+        if token and fingerprint not in seen:
+            tokens.append((source, token, fingerprint))
+            seen.add(fingerprint)
+    return tokens
 
 
 def profile_homes():
@@ -221,6 +325,9 @@ def collect_sources():
                     expectedAccount=account, plan=value.get("subscriptionType"), priority=1))
         except (ReadError, ValueError, TypeError, KeyError, OSError):
             errors.append(error_row("claude:desktop", "Claude Desktop", "claude", "Cannot read the Claude Desktop login"))
+    for source, token, fingerprint in antigravity_tokens():
+        sources.append(dict(provider="antigravity", sourceId="antigravity:" + fingerprint[:16],
+                            label="Gemini / Antigravity", source=source, token=token))
     return sources, errors
 
 
@@ -287,6 +394,57 @@ def codex_windows(data):
             reset = None
         rows.append(dict(id=identity, name=name, remaining=remaining(window.get("used_percent")), resetsAt=reset))
     return ensure_standard_windows(rows)
+
+
+def fraction_remaining(value):
+    if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value):
+        return None
+    return max(0, min(100, value * 100))
+
+
+def antigravity_windows(data):
+    rows = []
+    for group in data.get("groups") or []:
+        if not isinstance(group, dict):
+            continue
+        group_name = group.get("displayName") or group.get("name") or "Models"
+        for bucket in group.get("buckets") or []:
+            if not isinstance(bucket, dict):
+                continue
+            identity = bucket.get("bucketId") or bucket.get("id")
+            if not isinstance(identity, str) or not identity:
+                continue
+            remaining_value = bucket.get("remainingFraction")
+            nested = bucket.get("remaining")
+            if isinstance(nested, dict):
+                remaining_value = nested.get("remainingFraction", remaining_value)
+            value = fraction_remaining(remaining_value)
+            if value is None:
+                continue
+            bucket_name = bucket.get("displayName") or identity
+            normalized = identity.lower()
+            if "weekly" in normalized or "week" in normalized:
+                name = group_name + " weekly"
+            elif "5h" in normalized or "five" in normalized or "session" in normalized:
+                name = group_name + " 5-hour"
+            else:
+                name = group_name + " · " + bucket_name
+            reset = bucket.get("resetTime") or bucket.get("reset_time")
+            rows.append(dict(id=identity, name=name, remaining=value, resetsAt=reset))
+    if not rows:
+        raise ValueError("No quota buckets")
+    return rows
+
+
+def antigravity_quota(source):
+    metadata = {"ideName": "antigravity", "extensionName": "antigravity", "locale": "en",
+                "ideVersion": "unknown"}
+    setup = post_json(ANTIGRAVITY_LOAD, source["token"], metadata)
+    project = setup.get("project") or setup.get("projectId") or setup.get("cloudaicompanionProject")
+    payload = dict(metadata)
+    if isinstance(project, str) and project:
+        payload["project"] = project
+    return antigravity_windows(post_json(ANTIGRAVITY_QUOTA, source["token"], payload))
 
 
 def claude_identity(source, cache=None):
@@ -405,9 +563,11 @@ def read_usage(source, old):
                                 previous.get("apiErrorCode", "rate_limited"))
             raw = get_json("https://api.anthropic.com/api/oauth/usage", source["token"])
             row["limits"] = claude_windows(raw)
-        else:
+        elif source["provider"] == "codex":
             raw = get_json("https://chatgpt.com/backend-api/wham/usage", source["token"], source.get("accountId"))
             row["limits"] = codex_windows(raw)
+        else:
+            row["limits"] = antigravity_quota(source)
         row.update(fetchedAt=ISO(), error=None, retryAt=0, nextFetchAt=time.time() + POLL_INTERVAL)
     except ReadError as exc:
         # An existing wait is not a new failed request. Keep its deadline.
@@ -446,7 +606,7 @@ def snapshot():
         try:
             if source["provider"] == "claude":
                 source = claude_identity(source, identity_cache)
-            else:
+            elif source["provider"] == "codex":
                 subject = ""
                 try:
                     encoded = source.get("auth", {}).get("id_token", "").split(".")[1]
@@ -456,6 +616,10 @@ def snapshot():
                 except (IndexError, ValueError):
                     pass
                 source["identity"] = "codex:" + (source.get("accountId") or source["sourceId"]) + (":" + subject if subject else "")
+            else:
+                # The source ID is a one-way credential fingerprint. Google does
+                # not reliably include an account identifier in quota responses.
+                source["identity"] = source["sourceId"]
             key = source["identity"]
             if key in by_identity:
                 by_identity[key]["sourceIds"].append(source["sourceId"])
