@@ -210,19 +210,32 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual(reader.google_access_token(json.dumps({"refresh_token": "not-an-access-token"})), None)
         self.assertEqual(reader.google_access_token("not-json"), None)
 
+    def test_antigravity_cli_login_keeps_its_id_when_the_token_changes(self):
+        def found(token):
+            login = {"token": {"access_token": token, "refresh_token": "r"}, "id_token_email": "me@example.com"}
+            stored = b"go-keyring-base64:" + base64.b64encode(json.dumps(login).encode())
+            with patch.object(reader, "sqlite_value", return_value=None), \
+                 patch.object(reader, "load_json", return_value={}), \
+                 patch.object(reader, "keychain", return_value=stored):
+                return reader.antigravity_tokens()
+        first, second = found("one"), found("two")
+        self.assertEqual((first[0][1], second[0][1]), ("one", "two"))
+        self.assertEqual(first[0][2:], second[0][2:])
+        self.assertEqual(first[0][3], "me@example.com")
+
     def test_antigravity_quota_uses_reported_bucket_fractions_and_resets(self):
         data = {"groups": [
             {"displayName": "Gemini Models", "buckets": [
                 {"bucketId": "gemini-5h", "remaining": {"remainingFraction": 0.82}, "resetTime": "2026-11-23T12:00:00Z"},
                 {"bucketId": "gemini-weekly", "remainingFraction": 0.35, "resetTime": "2026-11-29T12:00:00Z"},
             ]},
-            {"displayName": "Claude + GPT", "buckets": [
+            {"displayName": "Claude and GPT models", "buckets": [
                 {"bucketId": "non-gemini-5h", "remainingFraction": 0.1},
             ]},
         ]}
         rows = reader.antigravity_windows(data)
         self.assertEqual([(row["name"], row["remaining"]) for row in rows], [
-            ("Gemini Models 5-hour", 82), ("Gemini Models weekly", 35), ("Claude + GPT 5-hour", 10),
+            ("Gemini 5-hour", 82), ("Gemini weekly", 35), ("Claude/GPT 5-hour", 10),
         ])
         self.assertEqual(rows[0]["resetsAt"], "2026-11-23T12:00:00Z")
 
@@ -235,11 +248,13 @@ class ReaderTests(unittest.TestCase):
         summary = {"groups": [{"displayName": "Gemini", "buckets": [
             {"bucketId": "gemini-5h", "remainingFraction": 0.4},
         ]}]}
-        with patch.object(reader, "post_json", side_effect=[{"project": "project-1"}, summary]) as request:
+        with patch.object(reader, "post_json", side_effect=[{"cloudaicompanionProject": "project-1"}, summary]) as request:
             row = reader.read_usage(source, {})
         self.assertEqual(row["limits"][0]["remaining"], 40)
         self.assertIsNone(row["error"])
-        self.assertEqual(request.call_args_list[1].args[2]["project"], "project-1")
+        # Google rejects any field it does not know with HTTP 400.
+        self.assertEqual([call.args[2] for call in request.call_args_list],
+                         [{"metadata": {"ideType": "ANTIGRAVITY"}}, {"project": "project-1"}])
 
     def test_browser_fallback_does_not_use_another_organization(self):
         record = {"provider": "claude", "usage": {"accountEmail": "same@example.com", "accountOrganization": "Other",

@@ -178,7 +178,7 @@ final class AccountUsageView: NSView {
             let y = CGFloat(index) * rowHeight
             let value = limit.remaining.map { percentText($0) + " left" } ?? "Not reported"
             let title = limit.name + " " + value
-            let field = label(title, frame: NSRect(x: 20, y: y, width: 180, height: 18))
+            let field = label(title, frame: NSRect(x: 20, y: y, width: 209, height: 18))
             let attributed = NSMutableAttributedString(string: title, attributes: [
                 .font: NSFont.menuFont(ofSize: 0),
                 .foregroundColor: stale ? NSColor.secondaryLabelColor : NSColor.labelColor
@@ -193,7 +193,7 @@ final class AccountUsageView: NSView {
             if let reset = dateFromISO(limit.resetsAt) {
                 let duration = reset.timeIntervalSinceNow
                 let text = duration > 0 ? "Resets in " + intervalText(duration) : "Reset due"
-                let caption = label(text, frame: NSRect(x: 198, y: y + 2, width: 124, height: 16), secondary: true)
+                let caption = label(text, frame: NSRect(x: 226, y: y + 2, width: 96, height: 16), secondary: true)
                 caption.alignment = .right
                 caption.toolTip = reset.formatted(date: .complete, time: .shortened)
             }

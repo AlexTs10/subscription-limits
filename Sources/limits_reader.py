@@ -171,16 +171,19 @@ def post_json(url, token, payload):
             raise ReadError("Usage checks paused (HTTP 429)",
                             retry_delay(exc.headers.get("Retry-After")), "rate_limited")
         if exc.code in (401, 403):
-            raise ReadError("Open Antigravity to renew its login", 300)
+            raise ReadError("Run agy or open Antigravity to renew login", 300)
         raise ReadError("Provider unavailable (HTTP %s)" % exc.code, 180)
     except (OSError, ValueError):
         raise ReadError("Connection unavailable", 60)
 
 
-def google_access_token(value):
-    """Extract an existing Antigravity OAuth access token without persisting it."""
+def google_login(value):
+    """Decode a stored Antigravity login, with or without the CLI keyring envelope."""
     if isinstance(value, bytes):
-        value = value.decode("utf-8", "strict")
+        try:
+            value = value.decode()
+        except UnicodeDecodeError:
+            return None
     if not isinstance(value, str) or not value:
         return None
     if value.startswith("go-keyring-base64:"):
@@ -192,14 +195,20 @@ def google_access_token(value):
         value = json.loads(value)
     except ValueError:
         return None
-    if not isinstance(value, dict):
+    return value if isinstance(value, dict) else None
+
+
+def google_access_token(value):
+    """Extract an existing Antigravity OAuth access token without persisting it."""
+    login = google_login(value)
+    if not login:
         return None
     for key in ("access_token", "accessToken"):
-        token = value.get(key)
+        token = login.get(key)
         if isinstance(token, str) and token:
             return token
-    for key in ("oauthToken", "credentials", "oauth"):
-        nested = value.get(key)
+    for key in ("token", "oauthToken", "credentials", "oauth"):
+        nested = login.get(key)
         if isinstance(nested, dict):
             token = google_access_token(json.dumps(nested))
             if token:
@@ -221,7 +230,11 @@ def sqlite_value(path, key):
 
 
 def antigravity_tokens():
-    """Find locally stored Antigravity logins, deduplicated by one-way fingerprint."""
+    """Find locally stored Antigravity logins, one per account.
+
+    Access tokens change every hour. The account email, when stored, gives a
+    stable ID; the token fingerprint is only the fallback.
+    """
     candidates = []
     app_token = sqlite_value(ANTIGRAVITY_STATE, "antigravityUnifiedStateSync.oauthToken")
     if app_token:
@@ -236,9 +249,13 @@ def antigravity_tokens():
     tokens, seen = [], set()
     for source, value in candidates:
         token = google_access_token(value)
-        fingerprint = hashlib.sha256(token.encode()).hexdigest() if token else None
-        if token and fingerprint not in seen:
-            tokens.append((source, token, fingerprint))
+        if not token:
+            continue
+        email = google_login(value).get("id_token_email")
+        email = email if isinstance(email, str) else ""
+        fingerprint = hashlib.sha256((email or token).encode()).hexdigest()
+        if fingerprint not in seen:
+            tokens.append((source, token, fingerprint, email))
             seen.add(fingerprint)
     return tokens
 
@@ -325,9 +342,9 @@ def collect_sources():
                     expectedAccount=account, plan=value.get("subscriptionType"), priority=1))
         except (ReadError, ValueError, TypeError, KeyError, OSError):
             errors.append(error_row("claude:desktop", "Claude Desktop", "claude", "Cannot read the Claude Desktop login"))
-    for source, token, fingerprint in antigravity_tokens():
+    for source, token, fingerprint, email in antigravity_tokens():
         sources.append(dict(provider="antigravity", sourceId="antigravity:" + fingerprint[:16],
-                            label="Gemini / Antigravity", source=source, token=token))
+                            label="Gemini / Antigravity", source=source, token=token, detail=email))
     return sources, errors
 
 
@@ -408,6 +425,8 @@ def antigravity_windows(data):
         if not isinstance(group, dict):
             continue
         group_name = group.get("displayName") or group.get("name") or "Models"
+        # The menu row is narrow; a long name would hide the percentage.
+        group_name = re.sub(r"\s+models$", "", group_name, flags=re.I).replace(" and ", "/")
         for bucket in group.get("buckets") or []:
             if not isinstance(bucket, dict):
                 continue
@@ -437,13 +456,9 @@ def antigravity_windows(data):
 
 
 def antigravity_quota(source):
-    metadata = {"ideName": "antigravity", "extensionName": "antigravity", "locale": "en",
-                "ideVersion": "unknown"}
-    setup = post_json(ANTIGRAVITY_LOAD, source["token"], metadata)
-    project = setup.get("project") or setup.get("projectId") or setup.get("cloudaicompanionProject")
-    payload = dict(metadata)
-    if isinstance(project, str) and project:
-        payload["project"] = project
+    setup = post_json(ANTIGRAVITY_LOAD, source["token"], {"metadata": {"ideType": "ANTIGRAVITY"}})
+    project = setup.get("cloudaicompanionProject")
+    payload = {"project": project} if isinstance(project, str) and project else {}
     return antigravity_windows(post_json(ANTIGRAVITY_QUOTA, source["token"], payload))
 
 
@@ -617,8 +632,8 @@ def snapshot():
                     pass
                 source["identity"] = "codex:" + (source.get("accountId") or source["sourceId"]) + (":" + subject if subject else "")
             else:
-                # The source ID is a one-way credential fingerprint. Google does
-                # not reliably include an account identifier in quota responses.
+                # Google does not include an account identifier in quota
+                # responses, so the source ID comes from the stored login.
                 source["identity"] = source["sourceId"]
             key = source["identity"]
             if key in by_identity:
